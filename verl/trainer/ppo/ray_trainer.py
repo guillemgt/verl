@@ -445,10 +445,22 @@ class RayPPOTrainer:
             if len(v) == n:
                 base_data[k] = v
 
+        def json_encode_default(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=json_encode_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
