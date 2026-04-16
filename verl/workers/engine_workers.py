@@ -307,9 +307,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 dp_group = self.engine.get_data_parallel_group()
                 dp_world = torch.distributed.get_world_size(dp_group)
                 if dp_world > 1:
-                    sizes = [None] * dp_world
-                    torch.distributed.all_gather_object(sizes, local_batch_size, dp_group)
-                    global_batch_size = sum(sizes)
+                    global_batch_size_tensor = torch.tensor(
+                        local_batch_size, device=mini_batch_td.device, dtype=torch.long
+                    )
+                    torch.distributed.all_reduce(
+                        global_batch_size_tensor, op=torch.distributed.ReduceOp.SUM, group=dp_group
+                    )
+                    global_batch_size = global_batch_size_tensor.item()
                 else:
                     global_batch_size = local_batch_size
 
