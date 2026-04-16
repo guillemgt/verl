@@ -858,8 +858,24 @@ class PPOTrainer:
                 self.checkpoint_manager.update_weights()
 
             # 4. collect necessary data for logging
+            # For multi-output agent loops, only use the final output per session for metrics.
+            # Keys have format {uid}_{session_id}_{index}; keep only the highest index per session.
+            final_indices = []
+            session_max: dict[str, tuple[int, int]] = {}  # session_key -> (max_index, position)
+            for pos, key in enumerate(batch.keys):
+                parts = key.rsplit("_", 2)
+                if len(parts) == 3:
+                    session_key = f"{parts[0]}_{parts[1]}"
+                    index = int(parts[2])
+                    if session_key not in session_max or index > session_max[session_key][0]:
+                        session_max[session_key] = (index, pos)
+                else:
+                    session_max[key] = (0, pos)
+            final_indices = sorted(pos for _, pos in session_max.values())
+            final_keys = [batch.keys[i] for i in final_indices]
+
             fields = ["uid", "prompts", "responses", "rm_scores", "num_turns", "reward_model", "data_source"]
-            data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+            data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
 
