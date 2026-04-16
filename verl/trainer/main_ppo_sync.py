@@ -22,6 +22,7 @@ Differs from original PPO trainer in main_ppo.py:
 """
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -942,6 +943,90 @@ class PPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Dump rollout/validation samples as JSONL."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+
+        n = len(inputs)
+        base_data = {
+            "input": inputs,
+            "output": outputs,
+            "gts": gts,
+            "score": scores,
+            "step": [self.global_steps] * n,
+        }
+
+        for k, v in reward_extra_infos_dict.items():
+            if len(v) == n:
+                base_data[k] = v
+
+        def json_encode_default(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+        lines = []
+        for i in range(n):
+            entry = {k: v[i] for k, v in base_data.items()}
+            lines.append(json.dumps(entry, ensure_ascii=False, default=json_encode_default))
+
+        with open(filename, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        print(f"Dumped generations to {filename}")
+
+    def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
+        """Fetch rollout data from TransferQueue and dump sorted by uid."""
+        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+            data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+            data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+
+            uids = data.pop("uid").tolist()
+            inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
+            outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
+            scores = data["rm_scores"].sum(dim=1).tolist()
+
+            reward_model = data.pop("reward_model", None)
+            if reward_model is not None:
+                gts = [item.get("ground_truth", None) for item in reward_model.tolist()]
+            else:
+                gts = [None] * len(uids)
+
+            # Sort by uid key ({sample}_{rollout}_{output})
+            sort_keys = []
+            for key in batch.keys:
+                parts = key.rsplit("_", 2)
+                if len(parts) == 3:
+                    sort_keys.append((parts[0], int(parts[1]), int(parts[2])))
+                else:
+                    sort_keys.append((key, 0, 0))
+            sorted_indices = sorted(range(len(sort_keys)), key=lambda i: sort_keys[i])
+
+            inputs = [inputs[i] for i in sorted_indices]
+            outputs = [outputs[i] for i in sorted_indices]
+            gts = [gts[i] for i in sorted_indices]
+            scores = [scores[i] for i in sorted_indices]
+
+            reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+
+            self._dump_generations(
+                inputs=inputs,
+                outputs=outputs,
+                gts=gts,
+                scores=scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=rollout_data_dir,
+            )
+
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
@@ -1378,7 +1463,12 @@ class PPOTrainer:
                 # 5. record metrics
                 self._compute_metrics(batch, metrics, timing_raw, global_steps=self.global_steps, epoch=epoch)
 
-                # 6. cleanup transfer queue and replay buffer
+                # 6. dump rollout generations if enabled
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    self._log_rollout_data(batch, timing_raw, rollout_data_dir)
+
+                # 7. cleanup transfer queue and replay buffer
                 tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
                 self.replay_buffer.remove(batch.partition_id, batch.keys)
 
