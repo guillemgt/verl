@@ -1009,18 +1009,9 @@ class PPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         dp_size = max(dp_rank_mapping) + 1
 
-        # TODO: It would be better to pad or upsample, but this is not supported by TransferQueue at the moment.
+        # TODO: up sampling if batch is not divisible by dp_size
         if len(batch) % dp_size != 0:
-            trim_size = len(batch) % dp_size
-            batch = KVBatchMeta(
-                keys=batch.keys[: len(batch) - trim_size],
-                tags=batch.tags[: len(batch) - trim_size],
-                partition_id=batch.partition_id,
-                fields=batch.fields,
-                extra_info=batch.extra_info,
-            )
-            global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
-            workload_lst = calculate_workload(global_seqlen_lst)
+            raise ValueError(f"Batch size {len(batch)} is not divisible by dp_size {dp_size}")
 
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
@@ -1029,7 +1020,6 @@ class PPOTrainer:
             seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
-        return batch
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
@@ -1403,7 +1393,7 @@ class PPOTrainer:
                 batch = self._compute_reward_colocate(batch)
 
         # 4. balance batch across data parallel groups
-        batch = self._balance_batch(batch, metrics=metrics)
+        self._balance_batch(batch, metrics=metrics)
 
         # 5. compute old_log_prob
         with marked_timer("old_log_prob", timing_raw, color="blue"):
