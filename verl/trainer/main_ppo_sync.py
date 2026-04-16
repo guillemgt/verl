@@ -1009,9 +1009,18 @@ class PPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         dp_size = max(dp_rank_mapping) + 1
 
-        # TODO: up sampling if batch is not divisible by dp_size
+        # TODO: It would be better to pad or upsample, but this is not supported by TransferQueue at the moment.
         if len(batch) % dp_size != 0:
-            raise ValueError(f"Batch size {len(batch)} is not divisible by dp_size {dp_size}")
+            trim_size = len(batch) % dp_size
+            batch = KVBatchMeta(
+                keys=batch.keys[: len(batch) - trim_size],
+                tags=batch.tags[: len(batch) - trim_size],
+                partition_id=batch.partition_id,
+                fields=batch.fields,
+                extra_info=batch.extra_info,
+            )
+            global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
+            workload_lst = calculate_workload(global_seqlen_lst)
 
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
@@ -1020,6 +1029,7 @@ class PPOTrainer:
             seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+        return batch
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
@@ -1200,10 +1210,10 @@ class PPOTrainer:
     def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the critic network."""
         ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        num_prompts = len(set(k.rsplit("_", 2)[0] for k in batch.keys))
+        num_mini_batch = max(1, num_prompts // ppo_mini_batch_size)
         extra_info = {
-            "global_batch_size": ppo_mini_batch_size,
-            "mini_batch_size": ppo_mini_batch_size,
+            "num_mini_batch": num_mini_batch,
             "epochs": self.config.critic.ppo_epochs,
             "seed": self.config.critic.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.critic.shuffle},
@@ -1222,14 +1232,14 @@ class PPOTrainer:
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        num_prompts = len(set(k.rsplit("_", 2)[0] for k in batch.keys))
+        num_mini_batch = max(1, num_prompts // ppo_mini_batch_size)
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
         extra_info = {
             "calculate_entropy": calculate_entropy,
-            "global_batch_size": ppo_mini_batch_size,
-            "mini_batch_size": ppo_mini_batch_size,
+            "num_mini_batch": num_mini_batch,
             "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
             "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
@@ -1393,7 +1403,7 @@ class PPOTrainer:
                 batch = self._compute_reward_colocate(batch)
 
         # 4. balance batch across data parallel groups
-        self._balance_batch(batch, metrics=metrics)
+        batch = self._balance_batch(batch, metrics=metrics)
 
         # 5. compute old_log_prob
         with marked_timer("old_log_prob", timing_raw, color="blue"):
