@@ -607,15 +607,7 @@ class AgentLoopWorker:
 
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
-        await self._compute_score(
-            output,
-            prompts=prompt_output["input_ids"],
-            responses=response_output["input_ids"],
-            attention_mask=attention_mask,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            kwargs=kwargs,
-        )
+        await self._compute_score([output], kwargs=kwargs)
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -726,27 +718,34 @@ class AgentLoopWorker:
         position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
         return position_ids
 
-    async def _compute_score(self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs):
-        """Compute reward score for single sample."""
+    async def _compute_score(self, outputs: list, kwargs: dict) -> None:
+        """Compute reward score for a list of agent loop outputs (scores outputs[-1])."""
         enable_async_reward = self.reward_loop_worker_handles is not None
 
-        if output.reward_score is None and enable_async_reward:
+        final_output = outputs[-1]
+        if final_output.reward_score is None and enable_async_reward:
             timing = {}
             with simple_timer("compute_score", timing):
+                prompts = torch.tensor(final_output.prompt_ids, dtype=torch.int64).unsqueeze(0)
+                responses = torch.tensor(final_output.response_ids, dtype=torch.int64).unsqueeze(0)
+                input_ids = torch.cat([prompts, responses], dim=1)
+                attention_mask = torch.ones_like(input_ids)
+                multi_modal_inputs = self._compute_multi_modal_inputs(final_output, input_ids.squeeze(0))
+                position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
                 batch = TensorDict(
                     {
-                        "prompts": prompts,  # [1, prompt_length]
-                        "responses": responses,  # [1, response_length]
-                        "attention_mask": attention_mask,  # [1, prompt_length + response_length]
-                        "input_ids": input_ids,  # [1, prompt_length + response_length]
+                        "prompts": prompts,
+                        "responses": responses,
+                        "attention_mask": attention_mask,
+                        "input_ids": input_ids,
                         "position_ids": position_ids,
                     },
                     batch_size=1,
                 )
                 non_tensor_batch = {
                     **{k: np.array([v]) for k, v in kwargs.items()},
-                    "__num_turns__": np.array([output.num_turns]),
-                    "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+                    "__num_turns__": np.array([final_output.num_turns]),
+                    "tool_extra_fields": np.array([final_output.extra_fields], dtype=object),
                 }
 
                 data = DataProto(
@@ -755,9 +754,9 @@ class AgentLoopWorker:
                 )
                 selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
                 result = await selected_reward_loop_worker_handle.compute_score.remote(data)
-                output.reward_score = result["reward_score"]
-                output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
-            output.metrics.compute_score = timing["compute_score"]
+                final_output.reward_score = result["reward_score"]
+                final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+            final_output.metrics.compute_score = timing["compute_score"]
 
     async def _compute_teacher_logprobs(
         self,

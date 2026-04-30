@@ -115,7 +115,6 @@ The rewards can be categorized as follows:
          return outputs
 
       async def compute_score(self, data: DataProto) -> dict:
-         assert len(data) == 1, "RewardLoopWorker only support single data item"
          if self.config.reward.custom_reward_function.path is not None:
             # directly use user-customized reward function
             return await self.reward_manager.run_single(data)
@@ -146,7 +145,8 @@ Users can also customize their own ``RewardManager``, inheriting from ``RewardMa
    @register("user_costomized")
    class UserCostomizedRewardManager(RewardManagerBase):
       async def run_single(self, data: DataProto) -> dict:
-         assert len(data) == 1, "Only support single data item"
+         data = data[-1:]  # for multi-sequence outputs, score only the last sequence
+         data_item = data[0]
          # your own reward manager
          ...
 
