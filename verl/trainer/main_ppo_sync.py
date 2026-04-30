@@ -1189,7 +1189,6 @@ class PPOTrainer:
             seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
-        return batch
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
@@ -1589,7 +1588,7 @@ class PPOTrainer:
                 batch = self._compute_reward_colocate(batch)
 
         # 4. balance batch across data parallel groups
-        batch = self._balance_batch(batch, metrics=metrics)
+        self._balance_batch(batch, metrics=metrics)
 
         # 5. compute old_log_prob
         with marked_timer("old_log_prob", timing_raw, color="blue"):
